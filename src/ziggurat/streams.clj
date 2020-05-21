@@ -1,7 +1,6 @@
 (ns ziggurat.streams
   (:require [clojure.tools.logging :as log]
             [mount.core :as mount :refer [defstate]]
-            [sentry-clj.async :as sentry]
             [ziggurat.channel :as chl]
             [ziggurat.config :refer [ziggurat-config]]
             [ziggurat.header-transformer :as header-transformer]
@@ -16,13 +15,14 @@
            [org.apache.kafka.common.serialization Serdes]
            [org.apache.kafka.common.utils SystemTime]
            [org.apache.kafka.streams KafkaStreams StreamsConfig StreamsBuilder Topology]
-           [org.apache.kafka.streams.kstream ValueMapper TransformerSupplier ValueTransformerSupplier]
+           [org.apache.kafka.streams.kstream JoinWindows ValueMapper TransformerSupplier ValueJoiner ValueTransformerSupplier]
            [org.apache.kafka.streams.state.internals KeyValueStoreBuilder RocksDbKeyValueBytesStoreSupplier]
            [ziggurat.timestamp_transformer IngestionTimeExtractor]
            [io.opentracing Tracer]
            [io.opentracing.contrib.kafka.streams TracingKafkaClientSupplier]
            [io.opentracing.contrib.kafka TracingKafkaUtils]
-           [io.opentracing.tag Tags]))
+           [io.opentracing.tag Tags]
+           [java.time Duration]))
 
 (def default-config-for-stream
   {:buffered-records-per-partition     10000
@@ -31,6 +31,9 @@
    :oldest-processed-message-in-s      604800
    :changelog-topic-replication-factor 3
    :session-timeout-ms-config          60000
+   :consumer-type                      :default
+   ;; :default-key-serde                  "org.apache.kafka.common.serialization.Serdes$StringSerde"
+   ;; :default-value-serde                "org.apache.kafka.common.serialization.Serdes$StringSerde"})
    :default-key-serde                  "org.apache.kafka.common.serialization.Serdes$ByteArraySerde"
    :default-value-serde                "org.apache.kafka.common.serialization.Serdes$ByteArraySerde"})
 
@@ -46,9 +49,9 @@
   "Populates `key-deserializer-encoding`, `value-deserializer-encoding` and `deserializer-encoding`
    in `properties` only if non-nil."
   [properties key-deserializer-encoding value-deserializer-encoding deserializer-encoding]
-  (let [KEY_DESERIALIZER_ENCODING "key.deserializer.encoding"
+  (let [KEY_DESERIALIZER_ENCODING   "key.deserializer.encoding"
         VALUE_DESERIALIZER_ENCODING "value.deserializer.encoding"
-        DESERIALIZER_ENCODING "deserializer.encoding"]
+        DESERIALIZER_ENCODING       "deserializer.encoding"]
     (if (some? key-deserializer-encoding)
       (.put properties KEY_DESERIALIZER_ENCODING key-deserializer-encoding))
     (if (some? value-deserializer-encoding)
@@ -102,6 +105,16 @@
     (metrics/multi-ns-increment-count multi-namespaces metric additional-tags))
   message)
 
+(defn- stream-joins-log-and-report-metrics [topic topic-entity message]
+  (let [service-name                  (:app-name (ziggurat-config))
+        topic-entity-name             (name topic-entity)
+        additional-tags               {:topic-name topic-entity-name :input-topic topic :app-name service-name}
+        message-read-metric-namespace "stream-joins-message"
+        multi-namespaces              [[message-read-metric-namespace]]
+        metric                        "read"]
+    (metrics/multi-ns-increment-count multi-namespaces metric additional-tags))
+  message)
+
 (defn store-supplier-builder []
   (KeyValueStoreBuilder. (RocksDbKeyValueBytesStoreSupplier. "state-store")
                          (Serdes/ByteArray)
@@ -126,10 +139,17 @@
     (get [_] (header-transformer/create))))
 
 (defn- timestamp-transform-values [topic-entity-name oldest-processed-message-in-s stream-builder]
-  (let [service-name     (:app-name (ziggurat-config))
+  (let [service-name           (:app-name (ziggurat-config))
         delay-metric-namespace "message-received-delay-histogram"
-        metric-namespaces [service-name topic-entity-name delay-metric-namespace]
-        additional-tags  {:topic_name topic-entity-name}]
+        metric-namespaces      [service-name topic-entity-name delay-metric-namespace]
+        additional-tags        {:topic_name topic-entity-name}]
+    (.transform stream-builder (timestamp-transformer-supplier metric-namespaces oldest-processed-message-in-s additional-tags) (into-array [(.name (store-supplier-builder))]))))
+
+(defn- stream-joins-delay-metric [topic topic-entity-name oldest-processed-message-in-s stream-builder]
+  (let [service-name           (:app-name (ziggurat-config))
+        delay-metric-namespace "stream-joins-message-received-delay-histogram"
+        metric-namespaces      [service-name topic-entity-name delay-metric-namespace]
+        additional-tags        {:topic-name topic-entity-name :input-topic topic :app-name service-name}]
     (.transform stream-builder (timestamp-transformer-supplier metric-namespaces oldest-processed-message-in-s additional-tags) (into-array [(.name (store-supplier-builder))]))))
 
 (defn- header-transform-values [stream-builder]
@@ -144,14 +164,14 @@
 
 (defn- traced-handler-fn [handler-fn channels message topic-entity]
   (let [parent-ctx (TracingKafkaUtils/extractSpanContext (:headers message) tracer)
-        span (as-> tracer t
-               (.buildSpan t "Message-Handler")
-               (.withTag t (.getKey Tags/SPAN_KIND) Tags/SPAN_KIND_CONSUMER)
-               (.withTag t (.getKey Tags/COMPONENT) "ziggurat")
-               (if (nil? parent-ctx)
-                 t
-                 (.asChildOf t parent-ctx))
-               (.start t))]
+        span       (as-> tracer t
+                     (.buildSpan t "Message-Handler")
+                     (.withTag t (.getKey Tags/SPAN_KIND) Tags/SPAN_KIND_CONSUMER)
+                     (.withTag t (.getKey Tags/COMPONENT) "ziggurat")
+                     (if (nil? parent-ctx)
+                       t
+                       (.asChildOf t parent-ctx))
+                     (.start t))]
     (try
       ((mapper-func handler-fn channels) (assoc (->MessagePayload (:value message) topic-entity) :headers (:headers message)))
       (catch Exception e
@@ -159,6 +179,45 @@
         (stop-streams stream))
       (finally
         (.finish span)))))
+
+(defn- join-streams
+  [oldest-processed-message-in-s handler-fn channels topic-entity stream-1 stream-2]
+  (let [topic-entity-name (name topic-entity)
+        topic-1           (:topic-name stream-1)
+        topic-2           (:topic-name stream-2)
+        cfg-1             (:cfg stream-1)
+        cfg-2             (:cfg stream-2)
+        strm-1            (->> (:stream stream-1)
+                               (stream-joins-delay-metric topic-1 topic-entity-name oldest-processed-message-in-s)
+                               (map-values #(stream-joins-log-and-report-metrics topic-1 topic-entity-name %)))
+        strm-2            (->> (:stream stream-2)
+                               (stream-joins-delay-metric topic-2 topic-entity-name oldest-processed-message-in-s)
+                               (map-values #(stream-joins-log-and-report-metrics topic-2 topic-entity-name %)))
+        join-window-ms    (JoinWindows/of (Duration/ofMillis (:join-window-ms cfg-1)))
+        join-type         (:join-type cfg-1)
+        value-joiner      (reify ValueJoiner
+                            (apply [_ left right]
+                              {:left left :right right}))
+        out-strm          (if cfg-1
+                            (case join-type
+                              :left  (.leftJoin strm-1 strm-2 value-joiner join-window-ms)
+                              :outer (.outerJoin strm-1 strm-2 value-joiner join-window-ms)
+                              (.join strm-1 strm-2 value-joiner join-window-ms))
+                            strm-1)]
+    {:stream out-strm
+     :cfg    cfg-2}))
+
+(defn- stream-joins-topology [handler-fn {:keys [input-topics join-cfg oldest-processed-message-in-s]} topic-entity channels]
+  (let [builder          (StreamsBuilder.)
+        _                (.addStateStore builder (store-supplier-builder))
+        stream-map       (map (fn [[input-topic _] [_ cfg]]
+                                (let [topic-name (name input-topic)]
+                                  {:stream (.stream builder topic-name) :cfg cfg :topic-name topic-name})) input-topics (assoc join-cfg :end nil))
+        {stream :stream} (reduce (partial join-streams oldest-processed-message-in-s handler-fn channels topic-entity) stream-map)]
+    (->> stream
+         (header-transform-values)
+         (map-values #(traced-handler-fn handler-fn channels % topic-entity)))
+    (.build builder)))
 
 (defn- topology [handler-fn {:keys [origin-topic oldest-processed-message-in-s]} topic-entity channels]
   (let [builder           (StreamsBuilder.)
@@ -173,9 +232,26 @@
     (.build builder)))
 
 (defn- start-stream* [handler-fn stream-config topic-entity channels]
-  (KafkaStreams. ^Topology (topology handler-fn stream-config topic-entity channels)
-                 ^Properties (properties stream-config)
-                 (new TracingKafkaClientSupplier tracer)))
+  (let [topology-fn (case (:consumer-type stream-config)
+                      :stream-joins stream-joins-topology
+                      topology)
+        top         (topology-fn handler-fn stream-config topic-entity channels)
+        _           (log/info (.describe top))]
+    (KafkaStreams. ^Topology top
+                   ^Properties (properties stream-config)
+                   (new TracingKafkaClientSupplier tracer))))
+
+(defn- merge-stream-joins-config ;; not sure about this, :consumer-type can be from the config.edn or the map from init-fn, please comment!
+  [config stream]
+  (let [new-cfg (case (:consumer-type config)
+                  :stream-joins (assoc config :consumer-type (:consumer-type config))
+                  (case (:consumer-type stream)
+                    :stream-joins (assoc config :consumer-type (:consumer-type stream))
+                    (assoc config :consumer-type :default)))]
+    (if (and (:default-key-serde stream)
+             (:default-value-serde stream))
+      (assoc new-cfg :default-key-serde (:default-key-serde stream) :default-value-serde (:default-value-serde stream))
+      new-cfg)))
 
 (defn start-streams
   ([stream-routes]
@@ -183,10 +259,12 @@
   ([stream-routes stream-configs]
    (reduce (fn [streams stream]
              (let [topic-entity     (first stream)
-                   topic-handler-fn (-> stream second :handler-fn)
+                   snd              (second stream)
+                   topic-handler-fn (:handler-fn snd)
                    channels         (chl/get-keys-for-topic stream-routes topic-entity)
                    stream-config    (-> stream-configs
                                         (get-in [:stream-router topic-entity])
+                                        (merge-stream-joins-config snd)
                                         (umap/deep-merge default-config-for-stream))
                    stream           (start-stream* topic-handler-fn stream-config topic-entity channels)]
                (.start stream)

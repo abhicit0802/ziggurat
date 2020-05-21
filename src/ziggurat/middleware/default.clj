@@ -1,10 +1,9 @@
 (ns ziggurat.middleware.default
   (:require [protobuf.impl.flatland.mapdef :as protodef]
             [sentry-clj.async :as sentry]
-            [ziggurat.config :refer [ziggurat-config]]
+            [ziggurat.config :refer [get-in-config ziggurat-config]]
             [flatland.protobuf.core :as proto]
             [ziggurat.metrics :as metrics]
-            [ziggurat.config :as config]
             [ziggurat.sentry :refer [sentry-reporter]]))
 
 (defn- deserialise-message
@@ -32,7 +31,9 @@
           (sentry/report-error sentry-reporter e (str "Couldn't parse the message with proto - " proto-class))
           (metrics/multi-ns-increment-count multi-namespaces "failed" additional-tags)
           nil)))
-    message))
+    (let [{:keys [left right]} message]
+      {:left  (deserialise-message left (if (vector? proto-class) (first proto-class) proto-class) topic-entity-name) ;; TODO: convert proto-class into a vector only on the next version
+       :right (deserialise-message right (if (vector? proto-class) (second proto-class) proto-class) topic-entity-name)})))
 
 (defn- deserialise-message-deprecated
   "This function takes in the message(proto Byte Array) and the proto-class and deserializes the proto ByteArray into a
@@ -59,10 +60,12 @@
           (sentry/report-error sentry-reporter e (str "Couldn't parse the message with proto - " proto-class))
           (metrics/multi-ns-increment-count multi-namespaces "failed" additional-tags)
           nil)))
-    message))
+    (let [{:keys [left right]} message]
+      {:left  (deserialise-message left (if (vector? proto-class) (first proto-class) proto-class) topic-entity-name) ;; TODO: convert proto-class into a vector only on the next version
+       :right (deserialise-message right (if (vector? proto-class) (second proto-class) proto-class) topic-entity-name)})))
 
 (defn get-deserializer []
-  (if (config/get-in-config [:alpha-features :protobuf-middleware :enabled])
+  (if (get-in-config [:alpha-features :protobuf-middleware :enabled])
     deserialise-message
     deserialise-message-deprecated))
 
@@ -70,4 +73,3 @@
   "This is a middleware function that takes in a message (Proto ByteArray or PersistentHashMap) and calls the handler-fn with the deserialized PersistentHashMap"
   [handler-fn proto-class topic-entity-name]
   (fn [message] (handler-fn ((get-deserializer) message proto-class topic-entity-name))))
-

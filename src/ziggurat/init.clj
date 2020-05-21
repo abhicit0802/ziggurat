@@ -139,16 +139,19 @@
 (defn- add-shutdown-hook [actor-stop-fn modes]
   (.addShutdownHook
    (Runtime/getRuntime)
-   (Thread. ^Runnable #(do (stop actor-stop-fn modes)
-                           (shutdown-agents))
+   (Thread. ^Runnable #((stop actor-stop-fn modes)
+                        (shutdown-agents))
             "Shutdown-handler")))
+
+(declare StreamRoute)
 
 (s/defschema StreamRoute
   (s/conditional
    #(and (seq %)
          (map? %))
-   {s/Keyword {:handler-fn (s/pred #(fn? %))
-               s/Keyword   (s/pred #(fn? %))}}))
+   {s/Keyword {:handler-fn                     (s/pred #(fn? %))
+               (s/optional-key :consumer-type) (s/enum :default :stream-joins)
+               s/Keyword                       (s/pred #(fn? %))}}))
 
 (defn validate-stream-routes [stream-routes modes]
   (when (or (empty? modes) (contains? (set modes) :stream-worker))
